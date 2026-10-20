@@ -40,6 +40,14 @@ class RealtorScraper(Scraper):
     SEARCH_GQL_URL = "https://www.realtor.com/frontdoor/graphql"
     NUM_PROPERTY_WORKERS = 20
     DEFAULT_PAGE_SIZE = 200
+    # NEW_COMMUNITY, OTHER, and READY_TO_BUILD are left out: they usually return nothing.
+    _COMMON_LISTING_TYPES = (
+        ListingType.FOR_SALE,
+        ListingType.FOR_RENT,
+        ListingType.SOLD,
+        ListingType.PENDING,
+        ListingType.OFF_MARKET,
+    )
 
     def __init__(self, scraper_input):
         super().__init__(scraper_input)
@@ -92,6 +100,11 @@ class RealtorScraper(Scraper):
         stop=stop_after_attempt(3),
     )
     def handle_location(self):
+        # Date filters can fan a search out into several status queries.
+        # The location lookup does not depend on listing type, so reuse it.
+        if getattr(self, "_location_resolved", False) and getattr(self, "_location_cache_key", None) == self.location:
+            return self._location_cache
+
         variables = {
             "searchInput": {
                 "search_term": self.location
@@ -114,6 +127,9 @@ class RealtorScraper(Scraper):
                 error_msgs = [e.get("message", "") for e in response_json.get("errors", [])]
                 if any("Required parameter is missing" in msg for msg in error_msgs):
                     raise Exception(f"Transient API error: {error_msgs}")
+            self._location_resolved = True
+            self._location_cache_key = self.location
+            self._location_cache = None
             return None
 
         geo_result = response_json["data"]["search_suggestions"]["geo_results"][0]
@@ -139,6 +155,9 @@ class RealtorScraper(Scraper):
                 if geo_id.startswith("addr:"):
                     result["mpr_id"] = geo_id.replace("addr:", "")
 
+        self._location_resolved = True
+        self._location_cache_key = self.location
+        self._location_cache = result
         return result
 
     def get_latest_listing_id(self, property_id: str) -> str | None:
@@ -208,6 +227,109 @@ class RealtorScraper(Scraper):
         except Exception:
             return []
 
+    def _listing_types_for_query(self) -> list[ListingType]:
+        """Statuses this search should ask for.
+
+        None means the common set (for sale, for rent, sold, pending, off market).
+        """
+        if self.listing_type is None:
+            return list(self._COMMON_LISTING_TYPES)
+        if isinstance(self.listing_type, list):
+            return list(self.listing_type)
+        return [self.listing_type]
+
+    @staticmethod
+    def _server_date_field(listing_type: ListingType) -> str | None:
+        """GraphQL date field Realtor can filter for a single status.
+
+        Pending stays unfiltered here: pending_date and contract_date are
+        broken on the API, so those results are trimmed client-side.
+        """
+        if listing_type == ListingType.SOLD:
+            return "sold_date"
+        if listing_type == ListingType.PENDING:
+            return None
+        return "list_date"
+
+    @staticmethod
+    def _shared_server_date_field(listing_types: list[ListingType]) -> str | None:
+        """Date field when every status uses the same one, else None."""
+        fields = {RealtorScraper._server_date_field(listing_type) for listing_type in listing_types}
+        if len(fields) == 1:
+            return fields.pop()
+        return None
+
+    def _requests_server_date_filter(self) -> bool:
+        """True when general_search would emit a date predicate for a known field."""
+        has_hour_precision = self.date_from_precision == "hour" or self.date_to_precision == "hour"
+        if has_hour_precision and (self.date_from or self.date_to):
+            return True
+        if self.past_hours:
+            return True
+        if self.date_from and self.date_to:
+            return True
+        if self.last_x_days:
+            return True
+        return False
+
+    def _pending_explicitly_requested(self) -> bool:
+        if self.listing_type == ListingType.PENDING:
+            return True
+        return isinstance(self.listing_type, list) and ListingType.PENDING in self.listing_type
+
+    def _date_search_groups(self) -> list:
+        """Listing-type values that can each be sent as one search query.
+
+        past_days (and date_from/date_to) used to be dropped whenever
+        listing_type was omitted or passed as a list, because those queries
+        mix sold_date and list_date. Realtor ANDs predicates, so the date
+        filter has to go out on a query whose statuses share one field.
+        """
+        if not self._requests_server_date_filter():
+            return [self.listing_type]
+
+        listing_types = self._listing_types_for_query()
+        if self.exclude_pending and not self._pending_explicitly_requested():
+            listing_types = [listing_type for listing_type in listing_types if listing_type != ListingType.PENDING]
+
+        grouped: dict[str | None, list[ListingType]] = {}
+        for listing_type in listing_types:
+            grouped.setdefault(self._server_date_field(listing_type), []).append(listing_type)
+
+        if not grouped:
+            return [self.listing_type]
+
+        groups = []
+        for field in ("list_date", "sold_date", None):
+            types = grouped.get(field)
+            if not types:
+                continue
+            groups.append(types[0] if len(types) == 1 else types)
+
+        if len(groups) == 1 and self._group_matches_current_listing_type(groups[0]):
+            return [self.listing_type]
+        return groups
+
+    def _group_matches_current_listing_type(self, group) -> bool:
+        # None means "the common set", which is not the same query as one date group.
+        return self.listing_type is not None and group == self.listing_type
+
+    @staticmethod
+    def _dedupe_homes(homes: list) -> list:
+        seen = set()
+        unique = []
+        for home in homes:
+            if isinstance(home, dict):
+                key = home.get("property_id")
+            else:
+                key = getattr(home, "property_id", None)
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            unique.append(home)
+        return unique
+
     def general_search(self, variables: dict, search_type: str) -> Dict[str, Union[int, Union[list[Property], list[dict]]]]:
         """
         Handles a location area & returns a list of properties
@@ -215,34 +337,10 @@ class RealtorScraper(Scraper):
 
         date_param = ""
 
-        # Determine date field based on listing type
-        # Convert listing_type to list for uniform handling
-        if self.listing_type is None:
-            # When None, return all common listing types as documented
-            # Note: NEW_COMMUNITY, OTHER, and READY_TO_BUILD are excluded as they typically return no results
-            listing_types = [
-                ListingType.FOR_SALE,
-                ListingType.FOR_RENT,
-                ListingType.SOLD,
-                ListingType.PENDING,
-                ListingType.OFF_MARKET,
-            ]
-            date_field = None  # When no listing_type is specified, skip date filtering
-        elif isinstance(self.listing_type, list):
-            listing_types = self.listing_type
-            # For multiple types, we'll use a general date field or skip
-            date_field = None  # Skip date filtering for mixed types
-        else:
-            listing_types = [self.listing_type]
-            # Determine date field for single type
-            if self.listing_type == ListingType.SOLD:
-                date_field = "sold_date"
-            elif self.listing_type in [ListingType.FOR_SALE, ListingType.FOR_RENT]:
-                date_field = "list_date"
-            else:  # PENDING or other types
-                # Skip server-side date filtering for PENDING as both pending_date and contract_date
-                # filters are broken in the API. Client-side filtering will be applied later.
-                date_field = None
+        # One query can only carry one date field. search() splits mixed
+        # statuses first so past_days is included instead of omitted.
+        listing_types = self._listing_types_for_query()
+        date_field = self._shared_server_date_field(listing_types)
 
         # Build date parameter (expand to full days if hour-based filtering is used)
         if date_field:
@@ -549,6 +647,55 @@ class RealtorScraper(Scraper):
         }
 
     def search(self):
+        groups = self._date_search_groups()
+        # One group that is already the requested listing_type keeps the
+        # original query path, including offset and pagination.
+        if groups == [self.listing_type]:
+            return self._search_one()
+
+        # A single address lookup ignores listing filters. Don't repeat it
+        # once per date group.
+        location_info = self.handle_location()
+        if not location_info:
+            return []
+        if location_info.get("area_type") == "address" and not self.radius:
+            return self._search_one()
+
+        original_listing_type = self.listing_type
+        original_limit = self.limit
+        original_offset = self.offset
+        original_sort_by = self.sort_by
+        original_sort_direction = self.sort_direction
+        try:
+            # Offset applies to the merged list. Each status query starts at 0
+            # and stops once it has enough rows to fill that window.
+            self.offset = 0
+            self.limit = original_offset + original_limit
+            homes: list = []
+            for group in groups:
+                self.listing_type = group
+                self.sort_by = original_sort_by
+                self.sort_direction = original_sort_direction
+                # Same early-stop sort a pending-only search already uses.
+                if group == ListingType.PENDING and not original_sort_by:
+                    self.sort_by = "pending_date"
+                    if not self.sort_direction:
+                        self.sort_direction = "desc"
+                homes.extend(self._search_one())
+            homes = self._dedupe_homes(homes)
+            self.sort_by = original_sort_by
+            self.sort_direction = original_sort_direction
+            if self.sort_by:
+                homes = self._apply_sort(homes)
+            return homes[original_offset:original_offset + original_limit]
+        finally:
+            self.listing_type = original_listing_type
+            self.limit = original_limit
+            self.offset = original_offset
+            self.sort_by = original_sort_by
+            self.sort_direction = original_sort_direction
+
+    def _search_one(self):
         location_info = self.handle_location()
         if not location_info:
             return []
