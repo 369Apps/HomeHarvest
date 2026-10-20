@@ -181,7 +181,7 @@ Optional
 ├── radius (decimal): Radius in miles to find comparable properties based on individual addresses.
 │    Example: 5.5 (fetches properties within a 5.5-mile radius if location is set to a specific address; otherwise, ignored)
 │
-├── past_days (integer): Number of past days to filter properties. Utilizes 'last_sold_date' for 'sold' listing types, and 'list_date' for others (for_rent, for_sale).
+├── past_days (integer): Number of past days to filter properties. Sold listings use sold_date, pending listings use pending_date, and other statuses use list_date. Works for a single listing_type, a list of types, or when listing_type is omitted.
 │    Example: 30 (fetches properties listed/sold in the last 30 days)
 │
 ├── past_hours (integer | timedelta): Number of past hours to filter properties (more precise than past_days). Uses client-side filtering.

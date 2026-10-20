@@ -66,7 +66,8 @@ def scrape_property(
     :param past_days: Get properties sold or listed (dependent on your listing_type) in the last _ days.
         - PENDING: Filters by pending_date. Contingent properties without pending_date are included.
         - SOLD: Filters by sold_date (when property was sold)
-        - FOR_SALE/FOR_RENT: Filters by list_date (when property was listed)
+        - FOR_SALE/FOR_RENT and other non-sold statuses: Filters by list_date (when property was listed)
+        - None or a list of types: each status is filtered on its own field, so past_days is still applied.
     :param date_from, date_to: Get properties sold or listed (dependent on your listing_type) between these dates.
         Accepts multiple formats for flexible precision:
         - Date strings: "2025-01-20" (day-level precision)
